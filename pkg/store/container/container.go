@@ -126,6 +126,16 @@ func (s *Store) Add(c Container) error {
 	return nil
 }
 
+// Update a container
+//
+// NOTE: only used for start container.
+func (s *Store) Update(c Container) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.idIndex.Add(c.ID)
+	s.containers[c.ID] = c
+}
+
 // Get returns the container with specified id. Returns store.ErrNotExist
 // if the container doesn't exist.
 func (s *Store) Get(id string) (Container, error) {

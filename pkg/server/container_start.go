@@ -82,15 +82,44 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 		return nil, errors.Errorf("sandbox container %q is not running", sandboxID)
 	}
 
+	// NOTE: There are two cases:
+	//
+	// 1. For create state, ContainerIO has been initialized during
+	// restart or CreateContainer. For precreated fifo, we have to close it
+	// to prevent fd or goroutine leaky.
+	//
+	// 2. For exited state, the event monitor will close ContainerIO after
+	// containerd.Task. Just in case, we can do second round close.
+	//
+	// Unknown state doesn't have ContainerIO but we can't restart unknown
+	// stated container. No need to worry about it.
+	if cntr.IO != nil {
+		cntr.IO.Close()
+	}
+
+	containerIO, err := cio.NewContainerIO(id,
+		cio.WithNewFIFOs(c.getVolatileContainerRootDir(id), meta.Config.GetTty(), meta.Config.GetStdin()),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create container io")
+	}
+
 	ioCreation := func(id string) (_ containerdio.IO, err error) {
 		stdoutWC, stderrWC, err := c.createContainerLoggers(meta.LogPath, config.GetTty())
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create container loggers")
 		}
-		cntr.IO.AddOutput("log", stdoutWC, stderrWC)
-		cntr.IO.Pipe()
-		return cntr.IO, nil
+		containerIO.AddOutput("log", stdoutWC, stderrWC)
+		containerIO.Pipe()
+		return containerIO, nil
 	}
+	defer func() {
+		if retErr != nil {
+			if err := containerIO.Close(); err != nil {
+				logrus.WithError(err).Errorf("failed to close container io %q", id)
+			}
+		}
+	}()
 
 	ctrInfo, err := container.Info(ctx)
 	if err != nil {
@@ -128,15 +157,29 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 		return nil, errors.Wrapf(err, "failed to start containerd task %q", id)
 	}
 
-	// Update container start timestamp.
-	if err := cntr.Status.UpdateSync(func(status containerstore.Status) (containerstore.Status, error) {
-		status.Pid = task.Pid()
-		status.StartedAt = time.Now().UnixNano()
-		return status, nil
-	}); err != nil {
-		return nil, errors.Wrapf(err, "failed to update container %q state", id)
+	status := containerstore.Status{
+		CreatedAt: cntr.Status.Get().CreatedAt,
+		Pid:       task.Pid(),
+		StartedAt: time.Now().UnixNano(),
+	}
+	newCntr, err := containerstore.NewContainer(meta,
+		containerstore.WithStatus(status, c.getContainerRootDir(id)),
+		containerstore.WithContainer(container),
+		containerstore.WithContainerIO(containerIO),
+	)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to recreate internal container object for %q", id)
 	}
 
+	// NOTE: In containerstore, we can't update object directly because
+	//
+	// 1. StopCh cann't be closed if the container is EXITED.
+	// 2. ContainerIO has been closed and cann't be reused for restart.
+	// 3. To avoid data race, object should be replaced entirely.
+	//
+	// containerd.Container represents the lifecycle of container, including
+	// snapshotter data. No need to recreate it and just reuse it.
+	c.containerStore.Update(newCntr)
 	// start the monitor after updating container state, this ensures that
 	// event monitor receives the TaskExit event and update container state
 	// after this.
@@ -150,7 +193,7 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 func setContainerStarting(container containerstore.Container) error {
 	return container.Status.Update(func(status containerstore.Status) (containerstore.Status, error) {
 		// Return error if container is not in created state.
-		if status.State() != runtime.ContainerState_CONTAINER_CREATED {
+		if !(status.State() == runtime.ContainerState_CONTAINER_CREATED || status.State() == runtime.ContainerState_CONTAINER_EXITED) {
 			return status, errors.Errorf("container is in %s state", criContainerStateToString(status.State()))
 		}
 		// Do not start the container when there is a removal in progress.
